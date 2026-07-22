@@ -1,0 +1,12 @@
+[project]
+name = "budget"
+dependencies = [
+  "google-genai",
+  "pydantic",
+  "python-dotenv",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+

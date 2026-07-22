@@ -1,0 +1,31 @@
+from google.genai import errors
+from google import genai
+from dotenv import load_dotenv
+import os
+
+
+def call_llm(prompt, schema):
+    load_dotenv()
+    api_key = os.environ.get("GEMINI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError("API key not found")
+
+    client = genai.Client(api_key=api_key)
+    model = "gemini-3-flash-preview"
+
+    try:
+        print("Calling Gemini API..")
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_json_schema": schema.model_json_schema(),
+            },
+        )
+    except errors.APIError as e:
+        raise RuntimeError("⚠️ Unexpected error") from e
+
+    validated = schema.model_validate_json(response.text)
+    return validated
