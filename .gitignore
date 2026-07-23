@@ -1,5 +1,9 @@
 assets/
+__pycache__/
+__marimo__/
+.venv/
 .DS_Store
 .env
+debug.py
 AGENTS.md
-__pycache__/
+README.md
