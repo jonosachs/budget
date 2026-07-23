@@ -1,6 +1,8 @@
 from pydantic import BaseModel, ConfigDict
 from decimal import Decimal
 from datetime import date
+from typing import Literal
+from config import get_taxonomy_children
 
 
 class Record(BaseModel):
@@ -14,7 +16,10 @@ class Record(BaseModel):
     category: str | None = None
 
 
-class RecordDto(BaseModel):
+CATEGORIES = tuple(get_taxonomy_children().keys())
+
+
+class RecordDtoIn(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     description: str
@@ -23,13 +28,18 @@ class RecordDto(BaseModel):
     confidence: float | None = None
 
 
+class RecordDtoOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    description: str
+    merchant: str | None = None
+    category: Literal[CATEGORIES] | None = None  # type: ignore[valid-type]
+    confidence: float | None = None
+
+
 class ReclassRecordDtos(BaseModel):
-    dtos: list[RecordDto]
+    dtos: list[RecordDtoOut]
     assumptions: str | None = None
-
-
-class GroupedCategrs(BaseModel):
-    groups: dict[str, list[str]]
 
 
 class Analysis(BaseModel):
@@ -38,7 +48,3 @@ class Analysis(BaseModel):
     per_category_spend: dict[str, Decimal]
     per_category_perc: dict[str, float]
     assumptions: str | None = None
-
-
-class Categories(BaseModel):
-    categrs: list[str]

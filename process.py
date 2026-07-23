@@ -1,72 +1,23 @@
 import pandas as pd
 from gemini import call_llm
-from models import Categories, Record, RecordDto, ReclassRecordDtos
+from models import Record, ReclassRecordDtos, RecordDtoIn, RecordDtoOut
+from config import BANK_ADAPTORS, TAXONOMY, get_taxonomy_children
+from in_out import write_records
 
-
-BANK_ADAPTORS = {
-    "nab": {
-        "columns": {
-            "Date": "date",
-            "Amount": "amount",
-            "Account Number": "account",
-            "Transaction Type": "type",
-            "Transaction Details": "description",
-            "Category": "category",
-            "Merchant Name": "merchant",
-        },
-        "date_format": "%d %b %y",
-    }
-}
-
-# Maps a parent category to the lowercase words identifying its children.
-# A category is grouped if ANY space-separated word in it appears in the child set.
-# Order matters: where a category matches several parents, the last one wins.
-CATEGR_GROUPS = {
-    "Transport": {"taxis", "ride", "transport", "public"},
-    # 'Car' follows 'Transport' so 'Transport Tolls' groups as a car cost
-    "Car": {"petrol", "fuel", "parking", "tolls", "vehicle", "registration"},
-    "Dining": {"cafe", "cafes", "coffee", "restaurants", "takeaway", "dining"},
-    "Alcohol": {"alcohol", "liquor", "bars", "nightlife"},
-    "Health": {
-        "medical",
-        "pharmacy",
-        "optometry",
-        "radiology",
-        "imaging",
-        "health",
-        "supplements",
-        "gym",
-        "fitness",
-    },
-    "Subscriptions": {
-        "subscriptions",
-        "streaming",
-        "media",
-        "software",
-        "vpn",
-        "apps",
-        "content",
-    },
-    "Shopping": {
-        "shopping",
-        "marketplace",
-        "stores",
-        "clothing",
-        "accessories",
-        "homeware",
-        "electronics",
-        "technology",
-        "department",
-    },
-    "Home": {"home", "improvement", "improvements", "handyman", "cleaning"},
-    "Government": {"government", "council", "rates", "emergency"},
-    "Transfers": {"transfers", "transfer"},
-    "Travel": {"travel", "accommodation"},
-    "Gifts": {"gifts", "florist"},
-    "Events": {"attractions", "events", "weddings"},
-    "Insurance": {"insurance"},
-    "Fees": {"fees"},
-    "Cash": {"cash"},
+CONFIDENCE_THRESHOLD = 0.9
+SIMILARITY_THRESHOLD = 0.9
+OUTPUT_PATH = "assets/record_dtos.json"
+STOPWORDS = {
+    "EFTPOS",
+    "INTL",
+    "TXN",
+    "FEE",
+    "MC",
+    "AUS",
+    "AU",
+    "PTY",
+    "LTD",
+    "LIMITED",
 }
 
 
@@ -100,103 +51,80 @@ def parse_as_records(df: pd.DataFrame) -> list[Record]:
     return records
 
 
-def convert_to_dtos(records: list[Record]) -> list[RecordDto]:
-    return [RecordDto.model_validate(r) for r in records]
+def convert_to_dtos(records: list[Record]) -> list[RecordDtoIn]:
+    return [RecordDtoIn.model_validate(r) for r in records]
 
 
-def reclassify_records(records: list[RecordDto]) -> ReclassRecordDtos:
-    categrs = get_unique_categrs(records)
-    print(f"Found {(len(categrs))} unique categories")
+def categorise_records(records: list[RecordDtoIn]) -> list[RecordDtoOut]:
+    categrs = tuple(get_taxonomy_children())
 
-    opaque_categrs = find_opaque_categrs(categrs)
-    print(f"Found the following opaque categories: {opaque_categrs}")
+    categorised = categorise_with_llm(records, categrs)
+    print(f"✅ Categorised {len(categorised.dtos)} records")
+    print(f"Assumptions: {categorised.assumptions}")
 
-    opaque_records = get_records_by_categr(records, opaque_categrs.categrs)
-    useable_categrs = set(categrs) - set(opaque_categrs.categrs)
-    opaque_reclass = reclass_opaque_records(opaque_records, sorted(useable_categrs))
-    print(f"Reclassified {len(opaque_reclass.dtos)} opaque records")
-
-    new_categrs = set(get_unique_categrs(opaque_reclass.dtos)) - set(categrs)
-    categrs_superset = sorted(useable_categrs | new_categrs)
-    print(f"{len(new_categrs)} new categories added.")
-    print(f"Full category list: {categrs_superset}")
-
-    orphaned_records = find_orphaned_records(records)
-    orphaned_reclass = classify_orphaned(orphaned_records, categrs_superset)
-    print(f"Reclassified {len(orphaned_reclass.dtos)} orphaned records")
-
-    reclass = ReclassRecordDtos(
-        dtos=orphaned_reclass.dtos + opaque_reclass.dtos,
-        assumptions=" ".join(
-            [(orphaned_reclass.assumptions or ""), (opaque_reclass.assumptions or "")]
-        ),
-    )
-
-    print(f"Reclassified total {len(reclass.dtos)} record.")
-    print(f"Assumptions: {reclass.assumptions}")
-
-    return reclass
+    return categorised.dtos
 
 
-def get_records_by_categr(
-    records: list[RecordDto], categrs: list[str]
-) -> list[RecordDto]:
-    return [r for r in records if r.category in categrs]
+def get_unique(records: list[RecordDtoIn], ids: list[int]) -> list[RecordDtoIn]:
+    filtered = [r for r in records if r.id in ids]
+    print(f"Filtered {len(filtered)} from total {len(records)} records.")
+    return filtered
 
 
-def find_opaque_categrs(categrs: list[str]) -> Categories:
-    prompt = f"""
-    Identify any financial transaction categories in the following list that are too generic/opaque and could be broken into subcategories. e.g. 'Services', 'Transfers'. 
-    {categrs}
-    """
-    return call_llm(prompt, Categories)
+def get_similarity(records: list[RecordDtoIn]) -> dict[int, list[int]]:
+    similarity_map = {}
+    seen = []
+
+    for record in records:
+        if record.id in seen:
+            continue
+
+        record_desc = set(
+            word.lower()
+            for word in record.description.split(" ")
+            if word.isalpha() and word.upper() not in STOPWORDS
+        )
+
+        if not record_desc:
+            similarity_map[record.id] = []
+            continue
+
+        similar_records = []
+
+        for comparison in records:
+            if record.id == comparison.id or comparison.id in seen:
+                continue
+
+            compar_descr = set(
+                word.lower()
+                for word in comparison.description.split(" ")
+                if word.isalpha() and word.upper() not in STOPWORDS
+            )
+
+            similarity = sum(word in compar_descr for word in record_desc) / max(
+                len(record_desc), len(compar_descr)
+            )
+
+            if similarity < SIMILARITY_THRESHOLD:
+                continue
+
+            similar_records.append(comparison.id)
+            seen.append(comparison.id)
+
+        similarity_map[record.id] = similar_records
+
+    return similarity_map
 
 
-# Reclassify records with opaque categories, e.g. 'Services'
-def reclass_opaque_records(
-    records: list[RecordDto], categrs: list[str]
+def categorise_with_llm(
+    records: list[RecordDtoIn], categrs: tuple
 ) -> ReclassRecordDtos:
     prompt = f"""
-For the following transactions with generic/opaque categories, re-classify them
-    into more informative subcategories.
-
-    Reuse an existing category wherever one fits. Only invent a new category when
-    nothing existing applies. Match the existing naming style (sentence case).
-
-    Existing categories:
-    {categrs}
-    Transactions:
-    {records}
-    """
-
-    response = call_llm(prompt, ReclassRecordDtos)
-    return response
-
-
-def get_unique_categrs(records: list[RecordDto]) -> list[str]:
-    categrs = {t.category for t in records if t.category}
-    return sorted(categrs)
-
-
-def find_orphaned_records(records: list[RecordDto]) -> list[RecordDto]:
-    orphaned = []
-    for r in records:
-        if r.category is None:
-            orphaned.append(r)
-
-    print(f"Found {len(orphaned)} uncategorised records")
-    return orphaned
-
-
-def classify_orphaned(
-    records: list[RecordDto], categrs: list[str]
-) -> ReclassRecordDtos:
-
-    prompt = f"""
-    Allocate each of these orphaned transactions to one of the categories in the list provided. 
+    Allocate each of these transactions to one of the allowed categories.
     Provide confidence for each (0-1).
+    Any records that already have categories are auto-generated and unvetted and should only be used as a fall-back guide to assist in placing in one of the allowed categories if other info is opaque.
 
-    Available categories:
+    Allowed categories:
     {categrs}
     Orphaned transactions:
     {records}
@@ -206,43 +134,71 @@ def classify_orphaned(
     return categorised
 
 
-def merge(dtos: ReclassRecordDtos, records: list[Record]) -> list[Record]:
-    dto_by_ids = {d.id: d for d in dtos.dtos}
+def merge(
+    categorsd_dtos: list[RecordDtoOut],
+    records: list[Record],
+    similarity_map: dict[int, list[int]],
+) -> list[Record]:
+    records_by_id = {r.id: r for r in records}
+    low_confidence: list[int] = []
+
+    # Clear categories to avoid original labels persisting
     for r in records:
-        if d := dto_by_ids.get(r.id):
-            r.category = d.category
+        r.category = None
+
+    for cdto in categorsd_dtos:
+        target_ids = [cdto.id, *similarity_map.get(cdto.id, [])]
+        if (
+            cdto.category is None
+            or cdto.confidence is None
+            or cdto.confidence < CONFIDENCE_THRESHOLD
+        ):
+            low_confidence.extend(target_ids)
+            continue
+
+        for rid in target_ids:
+            if r := records_by_id.get(rid):
+                r.category = cdto.category
+
+    if low_confidence:
+        print(
+            f"The following couldn't be allocated due to low confidence:\n{low_confidence}"
+        )
 
     return records
 
 
-def group_alike_categrs(records: list[Record]) -> list[Record]:
-    for parent, children in CATEGR_GROUPS.items():
-        for r in records:
-            if r.category and any(
-                word.lower() in children for word in r.category.split(" ")
-            ):
-                r.category = parent
+def generate_groups(records: list[Record]) -> dict[str, list[Record]]:
+    children = get_taxonomy_children()
+    output: dict[str, list[Record]] = {parent: [] for parent in TAXONOMY.keys()}
+    for r in records:
+        # If the record category is a child, add it to the parent category
+        if r.category and (parent := children.get(r.category)):
+            output[parent].append(r)
 
-    return records
+    return output
 
 
 def run_pipeline(df: pd.DataFrame) -> list[Record]:
     # Clean DataFrame to remove nan and sanitise cols
     df_clean = clean(df)
 
-    # Parse as Record model to assign UUIDs
+    # Parse as Record model to assign ids
     records = parse_as_records(df_clean)
 
     # Parse as DTOs to remove confidential cols e.g. account, amount
     dtos = convert_to_dtos(records)
 
-    # Reclassify records with poor categorisation
-    dtos_reclass = reclassify_records(dtos)
+    # Group similar records to optimise llm evaluation step
+    similarity_map = get_similarity(dtos)
+    unique_dtos = get_unique(dtos, sorted(similarity_map.keys()))
+
+    # Categorise records based on given taxonomy
+    dtos_categrsd = categorise_records(unique_dtos)
+
+    write_records(dtos_categrsd, OUTPUT_PATH)
 
     # Merge back into Records
-    merged = merge(dtos_reclass, records)
+    merged = merge(dtos_categrsd, records, similarity_map)
 
-    # Group record categories that are too granular
-    grouped = group_alike_categrs(merged)
-
-    return grouped
+    return merged
