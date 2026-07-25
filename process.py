@@ -72,35 +72,46 @@ def get_unique(records: list[RecordDtoIn], ids: list[int]) -> list[RecordDtoIn]:
 
 
 def get_similarity(records: list[RecordDtoIn]) -> dict[int, list[int]]:
+    """Build groups of alike records based on description similarity"""
+
     similarity_map = {}
     seen = []
 
+    # Pin each record for assessment one at a time
     for record in records:
+        # If the record has been assessed already skip it to avoid duplication
         if record.id in seen:
             continue
 
+        # Normalise and filter pinned record description
         record_desc = set(
             word.lower()
             for word in record.description.split(" ")
             if word.isalpha() and word.upper() not in STOPWORDS
         )
-
+        # If the normalised description is empty this record should have
+        # it's own category
         if not record_desc:
             similarity_map[record.id] = []
             continue
 
+        # Compare pinned record against other records and keep a list of
+        # those that are similar
         similar_records = []
-
         for comparison in records:
+            # Avoid comparing to self or previously seen record
             if record.id == comparison.id or comparison.id in seen:
                 continue
 
+            # Normalise description of the compared record
             compar_descr = set(
                 word.lower()
                 for word in comparison.description.split(" ")
                 if word.isalpha() and word.upper() not in STOPWORDS
             )
 
+            # Calculate similarity using largest description length to
+            # avoid misleading 100% similarity results
             similarity = sum(word in compar_descr for word in record_desc) / max(
                 len(record_desc), len(compar_descr)
             )
@@ -126,7 +137,7 @@ def categorise_with_llm(
 
     Allowed categories:
     {categrs}
-    Orphaned transactions:
+    Transactions:
     {records}
     """
 
@@ -139,26 +150,40 @@ def merge(
     records: list[Record],
     similarity_map: dict[int, list[int]],
 ) -> list[Record]:
+    """Merge category data from DTOs back to their Record objects"""
+
+    # Create id -> Record mapping so we can retrieve a Record object by its id
     records_by_id = {r.id: r for r in records}
     low_confidence: list[int] = []
 
-    # Clear categories to avoid original labels persisting
+    # Clear original categories so these do not persist and we can identify
+    # when the LLM couldn't classify a record
     for r in records:
         r.category = None
 
+    # Each record in categorsd_dtos represents a unique category
     for cdto in categorsd_dtos:
-        target_ids = [cdto.id, *similarity_map.get(cdto.id, [])]
+        # Create list of categegory member ids
+        categ_member_ids = [cdto.id, *similarity_map.get(cdto.id, [])]
+
+        # Check the DTO category allocation exists and confidence is above threshold
         if (
             cdto.category is None
             or cdto.confidence is None
             or cdto.confidence < CONFIDENCE_THRESHOLD
         ):
-            low_confidence.extend(target_ids)
+            # If not pass the whole category to the low_confidence bucket
+            low_confidence.extend(categ_member_ids)
             continue
 
-        for rid in target_ids:
-            if r := records_by_id.get(rid):
+        # Happy path: Merge category data from the DTO back to all
+        # category members' Record objects
+        for categ_id in categ_member_ids:
+            # if a Record id matches one of the ids in the category, retrieve
+            # the Record and assign the category data from the DTO
+            if r := records_by_id.get(categ_id):
                 r.category = cdto.category
+                r.confidence = cdto.confidence
 
     if low_confidence:
         print(
@@ -168,15 +193,15 @@ def merge(
     return records
 
 
-def generate_groups(records: list[Record]) -> dict[str, list[Record]]:
-    children = get_taxonomy_children()
-    output: dict[str, list[Record]] = {parent: [] for parent in TAXONOMY.keys()}
-    for r in records:
-        # If the record category is a child, add it to the parent category
-        if r.category and (parent := children.get(r.category)):
-            output[parent].append(r)
-
-    return output
+# def generate_groups(records: list[Record]) -> dict[str, list[Record]]:
+#     children = get_taxonomy_children()
+#     output: dict[str, list[Record]] = {parent: [] for parent in TAXONOMY.keys()}
+#     for r in records:
+#         # If the record category is a child, add it to the parent category
+#         if r.category and (parent := children.get(r.category)):
+#             output[parent].append(r)
+#
+#     return output
 
 
 def run_pipeline(df: pd.DataFrame) -> list[Record]:
@@ -189,16 +214,15 @@ def run_pipeline(df: pd.DataFrame) -> list[Record]:
     # Parse as DTOs to remove confidential cols e.g. account, amount
     dtos = convert_to_dtos(records)
 
-    # Group similar records to optimise llm evaluation step
+    # Group similar records to optimise LLM evaluation step
+    # (only one representative from each group needs to be assessed)
     similarity_map = get_similarity(dtos)
     unique_dtos = get_unique(dtos, sorted(similarity_map.keys()))
 
-    # Categorise records based on given taxonomy
+    # Categorise records based on given taxonomy using LLM
     dtos_categrsd = categorise_records(unique_dtos)
 
-    write_records(dtos_categrsd, OUTPUT_PATH)
-
-    # Merge back into Records
+    # Merge back into Record objects
     merged = merge(dtos_categrsd, records, similarity_map)
 
     return merged
