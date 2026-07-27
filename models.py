@@ -1,7 +1,6 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from decimal import Decimal
 from datetime import date
-from typing import Literal
 from config import get_taxonomy_children
 
 
@@ -19,6 +18,7 @@ class Record(BaseModel):
 
 
 CATEGORIES = tuple(get_taxonomy_children().keys())
+CANONICAL = {val.lower(): val for val in CATEGORIES}
 
 
 class RecordDtoIn(BaseModel):
@@ -35,8 +35,18 @@ class RecordDtoOut(BaseModel):
     id: int
     description: str
     merchant: str | None = None
-    category: Literal[CATEGORIES] | None = None  # type: ignore[valid-type]
+    category: str | None = None
     confidence: float | None = None
+
+    @field_validator("category")
+    @classmethod
+    def valid_category(cls, cat: str | None) -> str | None:
+        if cat is None:
+            return None
+        canonical = CANONICAL.get(cat.lower())
+        if canonical is None:
+            print(f"❌ Unknown category {cat!r}")
+        return canonical
 
 
 class ReclassRecordDtos(BaseModel):
