@@ -522,8 +522,16 @@ def parent_heatmap(
         .properties(height=90)
     )
 
-    return alt.vconcat(totals, heatmap, spacing=8, bounds="flush").resolve_scale(
-        x="shared"
+    return (
+        alt.vconcat(totals, heatmap, spacing=8, bounds="flush")
+        .resolve_scale(x="shared")
+        # Set explicitly so Streamlit leaves it alone: it only injects an autosize
+        # when the spec has none, and its heuristic downgrades any vconcat holding a
+        # layer to "pad". Under pad, Vega sizes the *plot* to the container and then
+        # adds the axis, labels and legend outside it, so the chart overhangs the
+        # page. fit-x sizes the whole thing, decorations included, to the width it
+        # is given. (See _has_nested_composition in streamlit/elements/vega_charts.)
+        .properties(autosize=alt.AutoSizeParams(type="fit-x", contains="padding"))
     )
 
 
