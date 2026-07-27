@@ -1,7 +1,8 @@
+import json
 import pandas as pd
 from gemini import call_llm
 from models import Record, ReclassRecordDtos, RecordDtoIn, RecordDtoOut
-from config import BANK_ADAPTORS, get_taxonomy_children
+from config import BANK_ADAPTORS, TAXONOMY, get_taxonomy_children
 from in_out import write_records
 import math
 
@@ -57,10 +58,10 @@ def convert_to_dtos(records: list[Record]) -> list[RecordDtoIn]:
     return [RecordDtoIn.model_validate(r) for r in records]
 
 
-def categorise_records(records: list[RecordDtoIn]) -> list[RecordDtoOut]:
-    categrs = tuple(get_taxonomy_children())
-
-    categorised = categorise_with_llm(records, categrs)
+def categorise_records(
+    records: list[RecordDtoIn], taxonomy: dict[str, list[str]] = TAXONOMY
+) -> list[RecordDtoOut]:
+    categorised = categorise_with_llm(records, taxonomy)
     print(f"✅ Categorised {len(categorised.dtos)} records")
     print(f"Assumptions: {categorised.assumptions}")
 
@@ -130,12 +131,13 @@ def get_similarity(records: list[RecordDtoIn]) -> dict[int, list[int]]:
 
 
 def categorise_with_llm(
-    records: list[RecordDtoIn], categrs: tuple, batch_size=BATCH_SIZE
+    records: list[RecordDtoIn], taxonomy: dict[str, list[str]], batch_size=BATCH_SIZE
 ) -> ReclassRecordDtos:
     prompt = """
     Allocate each of these transactions to one of the allowed categories.
     Provide confidence for each (0-1).
     Any records that already have categories are auto-generated and unvetted and should only be used as a fall-back guide to assist in placing in one of the allowed categories if other info is opaque."""
+    categrs = json.dumps(taxonomy, indent=2)
 
     assumptions, dtos = [], []
     for i in range(0, len(records), batch_size):
