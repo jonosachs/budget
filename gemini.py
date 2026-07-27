@@ -1,4 +1,3 @@
-from google.genai import errors
 from google import genai
 from dotenv import load_dotenv
 import os
@@ -14,22 +13,19 @@ def call_llm(prompt, schema):
     client = genai.Client(api_key=api_key)
     model = "gemini-3-flash-preview"
 
-    try:
-        print("Calling Gemini API..")
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_json_schema": schema.model_json_schema(),
-            },
-        )
+    print("Calling Gemini API..")
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+            "response_json_schema": schema.model_json_schema(),
+        },
+    )
 
-        if response.usage_metadata:
-            usage = response.usage_metadata.candidates_token_count
-            print(f"Output tokens: {usage}")
-    except errors.APIError as e:
-        raise RuntimeError("⚠️ Unexpected error") from e
+    if response.usage_metadata:
+        usage = response.usage_metadata.candidates_token_count
+        print(f"Output tokens: {usage}")
 
     validated = schema.model_validate_json(response.text)
     return validated
