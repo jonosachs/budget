@@ -2,8 +2,9 @@ import json
 import pandas as pd
 from gemini import call_llm
 from models import Record, ReclassRecordDtos, RecordDtoIn, RecordDtoOut
-from config import BANK_ADAPTORS, TAXONOMY, get_taxonomy_children
-from in_out import write_records
+from config import BANK_ADAPTORS, EXCLUDED, TAXONOMY, get_taxonomy_children
+from in_out import read_records, write_records
+from collections import Counter
 import math
 
 CONFIDENCE_THRESHOLD = 0.7
@@ -247,3 +248,35 @@ def run_pipeline(df: pd.DataFrame, bank: str) -> list[Record]:
     merged = merge(dtos_categrsd, records, similarity_map)
 
     return merged
+
+
+def reparent_records(path: str) -> int:
+    """Rewrite every record's parent to match the current taxonomy.
+
+    A maintenance pass, not part of run_pipeline. `parent` is denormalised onto
+    each record, so moving a category under a different parent in TAXONOMY leaves
+    every already-saved record pointing at the old one. Run this after any move.
+
+    Returns the number of records changed. A category no longer in the taxonomy is
+    reported and left alone rather than silently orphaned.
+    """
+    records = read_records(Record, path)
+    children = get_taxonomy_children()
+
+    changed, unknown = 0, Counter()
+    for r in records:
+        if r.category is None:
+            continue
+        # EXCLUDED sits outside the taxonomy on purpose, and is its own parent
+        parent = EXCLUDED if r.category == EXCLUDED else children.get(r.category)
+        if parent is None:
+            unknown[r.category] += 1
+        elif parent != r.parent:
+            r.parent = parent
+            changed += 1
+
+    for category, n in unknown.most_common():
+        print(f"⚠️  {n} record(s) in unknown category {category!r} — left as is")
+    if changed:
+        write_records(records, path)
+    return changed

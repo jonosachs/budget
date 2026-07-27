@@ -1,3 +1,9 @@
+# Manual-only category: park a transaction here to keep it out of every total.
+# Deliberately NOT in TAXONOMY - that dict is the LLM's option list, and nothing
+# should be auto-excluded. It is its own parent so parent-level views treat it
+# like any other top-level bucket.
+EXCLUDED = "Excluded"
+
 TAXONOMY = {
     "Housing": [
         "Mortgage",
@@ -11,6 +17,9 @@ TAXONOMY = {
         "Pest Control",
         "Removals & Storage",
         "Home Security",
+        "Building Insurance",
+        "Contents Insurance",
+        "Landlord Insurance",
     ],
     "Utilities": [
         "Electricity",
@@ -50,6 +59,7 @@ TAXONOMY = {
         "Roadside Assistance",
         "Car Purchase",
         "Car Repayments",
+        "Car Insurance",
     ],
     "Childcare": [
         "Daycare",
@@ -97,16 +107,12 @@ TAXONOMY = {
         "Personal Training",
         "Sports Club Membership",
     ],
+    # Insurance of a person. Anything insuring an asset lives under that asset, so
+    # a parent row answers "what does this cost me?" - see the note on Debt.
     "Insurance": [
         "Health Insurance",
-        "Car Insurance",
-        "Contents Insurance",
-        "Building Insurance",
-        "Landlord Insurance",
         "Life Insurance",
         "Income Protection",
-        "Travel Insurance",
-        "Pet Insurance",
         "Ambulance Cover",
     ],
     "Personal Care": [
@@ -122,6 +128,7 @@ TAXONOMY = {
         "Pet Grooming",
         "Boarding & Kennels",
         "Pet Training",
+        "Pet Insurance",
     ],
     "Shopping": [
         "Clothing",
@@ -135,7 +142,6 @@ TAXONOMY = {
         "Garden & Outdoor",
         "Department & General",
         "Online Marketplace",
-        "Books",
         "Office Supplies",
     ],
     "Subscriptions": [
@@ -174,6 +180,7 @@ TAXONOMY = {
         "Airport Parking & Transfers",
         "Visas & Passports",
         "Foreign Currency",
+        "Travel Insurance",
     ],
     "Government": ["Traffic Fines", "Licences & Permits", "Government Services"],
     "Fees": [
