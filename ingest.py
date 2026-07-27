@@ -24,7 +24,7 @@ STOPWORDS = {
 BATCH_SIZE = 150
 
 
-def clean(df: pd.DataFrame) -> pd.DataFrame:
+def normalise(df: pd.DataFrame) -> pd.DataFrame:
     # Remove empty cols
     df = df.dropna(axis=1, how="all")
 
@@ -47,10 +47,8 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_as_records(df: pd.DataFrame) -> list[Record]:
-    # Parse as Transaction model
     df_dict = df.to_dict(orient="records")
     records = [Record.model_validate({**row, "id": i}) for i, row in enumerate(df_dict)]
-
     return records
 
 
@@ -139,6 +137,7 @@ def categorise_with_llm(
     Any records that already have categories are auto-generated and unvetted and should only be used as a fall-back guide to assist in placing in one of the allowed categories if other info is opaque."""
     categrs = json.dumps(taxonomy, indent=2)
 
+    # Batch records for categorisation
     assumptions, dtos = [], []
     for i in range(0, len(records), batch_size):
         batch = records[i : i + batch_size]
@@ -154,6 +153,7 @@ def categorise_with_llm(
             f"Batch {i // batch_size + 1}/{math.ceil(len(records) / batch_size)} complete"
         )
 
+    # Combine output into a single object
     return ReclassRecordDtos(dtos=dtos, assumptions=" ".join(assumptions))
 
 
@@ -221,11 +221,11 @@ def merge(
 
 
 def run_pipeline(df: pd.DataFrame) -> list[Record]:
-    # Clean DataFrame to remove nan and sanitise cols
-    df_clean = clean(df)
+    # Normalise DataFrame to remove nan and sanitise cols
+    df_normd = normalise(df)
 
     # Parse as Record model to assign ids
-    records = parse_as_records(df_clean)
+    records = parse_as_records(df_normd)
 
     # Parse as DTOs to remove confidential cols e.g. account, amount
     dtos = convert_to_dtos(records)

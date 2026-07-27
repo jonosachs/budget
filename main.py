@@ -15,9 +15,11 @@ def run_ingest():
 
 
 def main():
+    # Optional 'ingest' param to run ingest pipeline which processes the csv file
+    # and normalises transactions to a list of Record objects. Must be run on first launch
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--ingest", action="store_true", help="Run ingest pipeline first"
+        "--ingest", action="store_true", help="Run ingest pipeline before analysis"
     )
     args = parser.parse_args()
 
