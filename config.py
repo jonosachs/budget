@@ -6,6 +6,7 @@ TAXONOMY = {
         "Property Rates",
         "Cleaning",
         "Maintenance",
+        "Renovations",
     ],
     "Utilities": ["Electricity", "Gas", "Water", "Internet", "Mobile Phone"],
     "Groceries": ["Groceries"],

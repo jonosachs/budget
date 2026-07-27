@@ -14,6 +14,7 @@ class Record(BaseModel):
     merchant: str | None = None
     account: int | None = None
     category: str | None = None
+    parent: str | None = None
     confidence: float | None = None
 
 

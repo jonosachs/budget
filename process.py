@@ -1,10 +1,11 @@
 import pandas as pd
 from gemini import call_llm
 from models import Record, ReclassRecordDtos, RecordDtoIn, RecordDtoOut
-from config import BANK_ADAPTORS, TAXONOMY, get_taxonomy_children
+from config import BANK_ADAPTORS, get_taxonomy_children
 from in_out import write_records
+import math
 
-CONFIDENCE_THRESHOLD = 0.9
+CONFIDENCE_THRESHOLD = 0.7
 SIMILARITY_THRESHOLD = 0.9
 OUTPUT_PATH = "assets/record_dtos.json"
 STOPWORDS = {
@@ -19,6 +20,7 @@ STOPWORDS = {
     "LTD",
     "LIMITED",
 }
+BATCH_SIZE = 150
 
 
 def clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -67,7 +69,7 @@ def categorise_records(records: list[RecordDtoIn]) -> list[RecordDtoOut]:
 
 def get_unique(records: list[RecordDtoIn], ids: list[int]) -> list[RecordDtoIn]:
     filtered = [r for r in records if r.id in ids]
-    print(f"Filtered {len(filtered)} from total {len(records)} records.")
+    print(f"Filtered {len(filtered)} unique records.")
     return filtered
 
 
@@ -128,21 +130,29 @@ def get_similarity(records: list[RecordDtoIn]) -> dict[int, list[int]]:
 
 
 def categorise_with_llm(
-    records: list[RecordDtoIn], categrs: tuple
+    records: list[RecordDtoIn], categrs: tuple, batch_size=BATCH_SIZE
 ) -> ReclassRecordDtos:
-    prompt = f"""
+    prompt = """
     Allocate each of these transactions to one of the allowed categories.
     Provide confidence for each (0-1).
-    Any records that already have categories are auto-generated and unvetted and should only be used as a fall-back guide to assist in placing in one of the allowed categories if other info is opaque.
+    Any records that already have categories are auto-generated and unvetted and should only be used as a fall-back guide to assist in placing in one of the allowed categories if other info is opaque."""
 
-    Allowed categories:
-    {categrs}
-    Transactions:
-    {records}
-    """
+    assumptions, dtos = [], []
+    for i in range(0, len(records), batch_size):
+        batch = records[i : i + batch_size]
+        response = call_llm(
+            f"{prompt}\nCategories:\n{categrs}\nRecords:\n{batch}",
+            ReclassRecordDtos,
+        )
+        dtos.extend(response.dtos)
+        if response.assumptions:
+            assumptions.append(response.assumptions)
 
-    categorised = call_llm(prompt, ReclassRecordDtos)
-    return categorised
+        print(
+            f"Batch {i // batch_size + 1}/{math.ceil(len(records) / batch_size)} complete"
+        )
+
+    return ReclassRecordDtos(dtos=dtos, assumptions=" ".join(assumptions))
 
 
 def merge(
@@ -155,6 +165,9 @@ def merge(
     # Create id -> Record mapping so we can retrieve a Record object by its id
     records_by_id = {r.id: r for r in records}
     low_confidence: list[int] = []
+
+    # Get children -> parent category map for logging record parent categories
+    children = get_taxonomy_children()
 
     # Clear original categories so these do not persist and we can identify
     # when the LLM couldn't classify a record
@@ -184,6 +197,7 @@ def merge(
             if r := records_by_id.get(categ_id):
                 r.category = cdto.category
                 r.confidence = cdto.confidence
+                r.parent = children.get(cdto.category)
 
     if low_confidence:
         print(
@@ -221,6 +235,9 @@ def run_pipeline(df: pd.DataFrame) -> list[Record]:
 
     # Categorise records based on given taxonomy using LLM
     dtos_categrsd = categorise_records(unique_dtos)
+
+    # Write categorised values before discarding below threshold (for debugging)
+    write_records(dtos_categrsd, OUTPUT_PATH)
 
     # Merge back into Record objects
     merged = merge(dtos_categrsd, records, similarity_map)

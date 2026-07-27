@@ -24,6 +24,10 @@ def call_llm(prompt, schema):
                 "response_json_schema": schema.model_json_schema(),
             },
         )
+
+        if response.usage_metadata:
+            usage = response.usage_metadata.candidates_token_count
+            print(f"Output tokens: {usage}")
     except errors.APIError as e:
         raise RuntimeError("⚠️ Unexpected error") from e
 
