@@ -10,9 +10,10 @@ Three entry points:
 draw into the current container and start nothing. `launch()` is what actually
 opens a browser.
 
-Every section is cross-filtered through one shared `Selection` (see the class
-docstring): a click anywhere narrows everything else, and each section ignores
-only the dimension it is itself the source of.
+The interactive sections are cross-filtered through one shared `Selection` (see
+the class docstring): a click on the heatmap or the trend narrows everything
+else, and each section ignores only the dimension it is itself the source of.
+The top-10 tables sit outside that — they are a fixed reference, not a control.
 
 Importing this module has no side effects. `st.set_page_config` lives in `main()`
 alone, since Streamlit allows it only once per page and only before any other
@@ -21,7 +22,7 @@ alone, since Streamlit allows it only once per page and only before any other
 
 from in_out import read_records, write_records
 from models import Record
-from config import get_taxonomy_children
+from config import get_taxonomy_children, EXCLUDED
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast, ClassVar, Collection
@@ -33,17 +34,20 @@ import sys
 
 RECORDS_PATH = "assets/records.json"
 
-# Manual-only category: the user parks a transaction here to keep it out of every
-# total. Deliberately NOT in TAXONOMY — that dict is the LLM's option list, and
-# nothing should be auto-excluded. It is its own parent so parent-level views
-# (the heatmap, the filter) treat it like any other top-level bucket.
-EXCLUDED = "Excluded"
 CATEGORIES = sorted(get_taxonomy_children().keys())
 EDITABLE_CATEGORIES = CATEGORIES + [EXCLUDED]
 
 # Sequential single-hue ramp, light -> dark. Reversed on a dark page so the
 # lightest end always means "most spend" and near-zero recedes into the surface.
-BLUE_RAMP = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
+BLUE_RAMP = [
+    "#cde2fb",
+    "#9ec5f4",
+    "#6da7ec",
+    "#3987e5",
+    "#256abf",
+    "#184f95",
+    "#0d366b",
+]
 # Fixed hue order for series identity: assigned in order, never cycled or resorted,
 # so a category keeps its colour as the selection changes.
 CATEGORICAL = [
@@ -61,7 +65,8 @@ CATEGORICAL = [
 SELECTION_KEY = "selection"  # the shared Selection, single source of truth
 EPOCH_KEY = "selection_epoch"  # bumped on clear, see widget_key()
 SEED_KEY = "explore_seed"  # last value pushed into the category picker
-DEFAULT_CATEGORIES = ("Maintenance", "Accommodation")
+SAVES_KEY = "saves"  # bumped on every save, see category_editor()
+DEFAULT_CATEGORIES = ()
 
 
 # ------------------------------------------------------------------ selection
@@ -278,7 +283,9 @@ def render_selection_bar(selection: Selection) -> None:
     page can sit filtered down to near-nothing with no visible cause.
     """
     if not selection:
-        st.caption("Click any table row, heatmap cell or chart point to filter the page.")
+        st.caption(
+            "Click a heatmap row, a monthly total or a trend point to filter the page."
+        )
         return
 
     message, button = st.columns([5, 1], vertical_alignment="center")
@@ -306,119 +313,90 @@ def render_summary(df: pd.DataFrame) -> None:
     )
 
 
-def render_top_tables(df: pd.DataFrame, selection: Selection, top_n: int = 10) -> None:
+def category_editor(frame: pd.DataFrame, key: str, columns: dict) -> None:
+    """Transaction table whose only editable column is Category, plus a save action.
+
+    Everything else is a fact the CSV owns, so `disabled` is derived rather than
+    listed — a column added to `frame` cannot accidentally become editable. `id`
+    rides along hidden because it is what matches an edit back to its record.
+
+    The key carries a save counter: a data_editor holds pending edits against row
+    *positions*, and saving can move a row out of the table under it (correcting a
+    category drops it from a category-filtered drilldown). Without a fresh widget
+    those edits would land on whichever rows shuffled into those positions.
+    """
+    edited = st.data_editor(
+        frame,
+        column_config={
+            "id": None,  # hidden, but kept so we can map edits back
+            "category": st.column_config.SelectboxColumn(
+                "Category", options=EDITABLE_CATEGORIES, required=True, width="small"
+            ),
+            "parent": st.column_config.TextColumn("Parent", width="small"),
+            **columns,
+        },
+        disabled=[c for c in frame.columns if c != "category"],
+        hide_index=True,
+        key=f"{key}:{st.session_state.get(SAVES_KEY, 0)}",
+    )
+
+    if st.button("Save corrections", key=f"{key}:save"):
+        changed = save_category_edits(cast(pd.DataFrame, edited))
+        if changed:
+            get_records.clear()
+            st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
+            st.success(f"Updated {changed} record(s).")
+            st.rerun()
+        else:
+            st.info("No changes to save.")
+
+
+def render_top_tables(df: pd.DataFrame, top_n: int = 10) -> None:
     """Biggest single transactions beside the biggest categories.
 
-    Both tables are built from the unfiltered frame, like the heatmap: a top 10
-    that re-ranks under its own filter is a moving target. A selection made
-    elsewhere shows up as selected rows instead, wherever it reaches into the
-    top 10. Source of the `categories` dimension — a records row contributes its
-    own category.
+    Built from the unfiltered frame and deliberately inert as a *filter*: these
+    are a fixed reference for the year's largest spends, not a control, and
+    everything that drives the page is a click on the heatmap or the trend.
+
+    The records table is still editable, though — a mis-categorised transaction is
+    most likely to be noticed here, where the biggest spends are, so it is worth
+    being able to fix it without hunting the record down in the drilldown first.
     """
-    # Both frames reset the index because a dataframe selection is row *positions*.
-    top_records = cast(
-        pd.DataFrame,
-        df.nlargest(top_n, "spend")[
-            ["date", "spend", "merchant", "description", "category", "parent"]
-        ].reset_index(drop=True),
-    )
-    top_categories = cast(
-        pd.DataFrame,
-        df.groupby(["category", "parent"], as_index=False)
-        .agg(spend=("spend", "sum"))
-        .nlargest(top_n, "spend")[["category", "parent", "spend"]]
-        .reset_index(drop=True),
-    )
-
-    def preselected(frame: pd.DataFrame) -> pd.Series:
-        """Mask of the rows a selection made elsewhere on the page already implies.
-
-        Category only, deliberately. Seeding on `parent` too would put rows on
-        screen that the user cannot switch off: deselecting one says nothing about
-        the parent that put it there, so it would just come straight back.
-        """
-        return frame["category"].isin(selection.categories)
-
-    def positions(mask: pd.Series) -> list[int]:
-        """The mask as the row positions Streamlit wants. Index is reset, so
-        position and label are the same number."""
-        return mask.index[mask].tolist()
-
-    records_seed = preselected(top_records)
-    categories_seed = preselected(top_categories)
-
-    # selection_default only applies when a widget is first created, so the key has
-    # to move with it — otherwise a selection made elsewhere never reaches the table.
-    key = widget_key("top", selection.categories)
-
     records_col, categories_col = st.columns([3, 2])
 
     with records_col:
         st.subheader(f"Top {top_n} expense records")
-        records_event = st.dataframe(
-            top_records,
-            key=f"{key}:records",
-            selection_default={"selection": {"rows": positions(records_seed)}},
-            column_config={
+        category_editor(
+            cast(
+                pd.DataFrame,
+                df.nlargest(top_n, "spend")[
+                    ["id", "date", "spend", "merchant", "description", "category", "parent"]
+                ].reset_index(drop=True),  # editor holds edits against row positions
+            ),
+            key="top_records_editor",
+            columns={
                 "date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
                 "spend": st.column_config.NumberColumn("Spend", format="dollar"),
                 "merchant": st.column_config.TextColumn("Merchant", width="medium"),
                 "description": st.column_config.TextColumn(
                     "Description", width="medium"
                 ),
-                "category": st.column_config.TextColumn("Category", width="small"),
-                "parent": st.column_config.TextColumn("Parent", width="small"),
             },
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="multi-row",
         )
-        st.caption("Select rows to filter the page by their categories.")
 
     with categories_col:
         st.subheader(f"Top {top_n} expense categories")
-        categories_event = st.dataframe(
-            top_categories,
-            key=f"{key}:categories",
-            selection_default={"selection": {"rows": positions(categories_seed)}},
+        st.dataframe(
+            df.groupby(["category", "parent"], as_index=False)
+            .agg(spend=("spend", "sum"))
+            .nlargest(top_n, "spend"),
             column_config={
                 "category": st.column_config.TextColumn("Category"),
                 "parent": st.column_config.TextColumn("Parent"),
                 "spend": st.column_config.NumberColumn("Spend", format="dollar"),
             },
             hide_index=True,
-            on_select="rerun",
-            selection_mode="multi-row",
         )
-        st.caption("Select rows to filter the page by those categories.")
-
-    def selected(event, frame: pd.DataFrame) -> set[str]:
-        # iloc, not loc: Streamlit hands back row *positions*
-        rows = event.get("selection", {}).get("rows", [])
-        return set(frame["category"].iloc[rows])
-
-    # Each table reports what the user *changed* against what we seeded it with,
-    # never the categories it happens to be showing. Unioning the two tables looks
-    # equivalent and is not: several records share a category, so a category
-    # switched off in one table stays in the other's union and snaps straight back.
-    # A delta says "remove this" in a way the other table cannot contradict.
-    added: set[str] = set()
-    removed: set[str] = set()
-    for event, frame, seed in (
-        (records_event, top_records, records_seed),
-        (categories_event, top_categories, categories_seed),
-    ):
-        picked = selected(event, frame)
-        seeded = set(frame.loc[seed, "category"])
-        added |= picked - seeded
-        removed |= seeded - picked
-
-    categories = tuple(sorted((set(selection.categories) | added) - removed))
-    # Written straight to the selection rather than through push(): the delta is
-    # already exact, so comparing against the current value is all the guard needed.
-    if categories != selection.categories:
-        st.session_state[SELECTION_KEY] = replace(selection, categories=categories)
-        st.rerun()
 
 
 def parent_heatmap(
@@ -643,50 +621,37 @@ def render_drilldown(df: pd.DataFrame, selection: Selection) -> None:
         st.info("No transactions match the current selection.")
         return
 
-    edited = st.data_editor(
-        detail[
-            [
-                "id",
-                "date",
-                "amount",
-                "merchant",
-                "description",
-                "category",
-                "parent",
-                "confidence",
-            ]
-        ],
-        column_config={
-            "id": None,  # hidden, but kept so we can map edits back
+    category_editor(
+        cast(
+            pd.DataFrame,
+            detail[
+                [
+                    "id",
+                    "date",
+                    "amount",
+                    "merchant",
+                    "description",
+                    "category",
+                    "parent",
+                    "confidence",
+                ]
+            ].reset_index(drop=True),
+        ),
+        # Scoped to the selection as well as the save count: a different selection
+        # is a different set of rows in the same positions.
+        key=widget_key(
+            "detail_editor", selection.parents, selection.categories, selection.months
+        ),
+        columns={
             "date": st.column_config.DateColumn("Date", format="DD MMM YYYY"),
             "amount": st.column_config.NumberColumn("Amount", format="dollar"),
             "merchant": st.column_config.TextColumn("Merchant", width="medium"),
             "description": st.column_config.TextColumn("Description", width="medium"),
-            "category": st.column_config.SelectboxColumn(
-                "Category", options=EDITABLE_CATEGORIES, required=True, width="small"
-            ),
-            "parent": st.column_config.TextColumn("Parent", width="small"),
             "confidence": st.column_config.NumberColumn(
                 "Confidence", format="%.2f", width="small"
             ),
         },
-        disabled=["date", "amount", "merchant", "description", "confidence"],
-        hide_index=True,
-        # Edits are held against row positions too, so a new selection needs a new
-        # widget — otherwise a pending edit lands on whatever row now sits there.
-        key=widget_key(
-            "detail_editor", selection.parents, selection.categories, selection.months
-        ),
     )
-
-    if st.button("Save corrections"):
-        changed = save_category_edits(cast(pd.DataFrame, edited))
-        if changed:
-            get_records.clear()
-            st.success(f"Updated {changed} record(s).")
-            st.rerun()
-        else:
-            st.info("No changes to save.")
 
 
 def explore_seed(
@@ -784,7 +749,7 @@ def render(df: pd.DataFrame | None = None) -> None:
 
     render_selection_bar(selection)
     render_summary(selection.filter(df))
-    render_top_tables(df, selection)
+    render_top_tables(df)
     render_parent_heatmap(df, selection)
     render_explore(df, selection)
     if selection:
