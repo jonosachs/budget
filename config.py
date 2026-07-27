@@ -135,6 +135,7 @@ TAXONOMY = {
         "Garden & Outdoor",
         "Department & General",
         "Online Marketplace",
+        "Books",
         "Office Supplies",
     ],
     "Subscriptions": [

@@ -6,21 +6,20 @@ import argparse
 
 CSV_PATH = "assets/expenses_FY26.csv"
 OUTPUT_PATH = "assets/records.json"
+BANK = "NAB"
 
 
 def run_ingest():
     df = pd.read_csv(CSV_PATH)
-    records = ingest.run_pipeline(df)
+    records = ingest.run_pipeline(df, BANK)
     write_records(records, OUTPUT_PATH)
 
 
 def main():
-    # Optional 'ingest' param to run ingest pipeline which processes the csv file
-    # and normalises transactions to a list of Record objects. Must be run on first launch
+    # Optional CLI param to ingest csv file
+    # Must be run at least once on first launch
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--ingest", action="store_true", help="Run ingest pipeline before analysis"
-    )
+    parser.add_argument("--ingest", action="store_true", help="Ingest csv file")
     args = parser.parse_args()
 
     if args.ingest:

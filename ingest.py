@@ -24,12 +24,14 @@ STOPWORDS = {
 BATCH_SIZE = 150
 
 
-def normalise(df: pd.DataFrame) -> pd.DataFrame:
+def normalise(df: pd.DataFrame, bank: str) -> pd.DataFrame:
+    bank_adaptor = BANK_ADAPTORS[bank]
+
     # Remove empty cols
     df = df.dropna(axis=1, how="all")
 
     # Sanitise/rename columns to match model
-    df = df.rename(columns=BANK_ADAPTORS["nab"]["columns"])
+    df = df.rename(columns=bank_adaptor["columns"])
 
     # Replace Uncategorised category with None
     df["category"] = df["category"].replace({"Uncategorised": None})
@@ -39,7 +41,7 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
 
     # Parse dates
     df["date"] = pd.to_datetime(
-        df["date"], format=BANK_ADAPTORS["nab"]["date_format"], errors="raise"
+        df["date"], format=bank_adaptor["date_format"], errors="raise"
     )
 
     print(f"Obtained csv with {len(df)} entries")
@@ -220,9 +222,9 @@ def merge(
 #     return output
 
 
-def run_pipeline(df: pd.DataFrame) -> list[Record]:
+def run_pipeline(df: pd.DataFrame, bank: str) -> list[Record]:
     # Normalise DataFrame to remove nan and sanitise cols
-    df_normd = normalise(df)
+    df_normd = normalise(df, bank)
 
     # Parse as Record model to assign ids
     records = parse_as_records(df_normd)
