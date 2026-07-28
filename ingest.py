@@ -2,14 +2,19 @@ import json
 import pandas as pd
 from gemini import call_llm
 from models import Record, ReclassRecordDtos, RecordDtoIn, RecordDtoOut
-from config import BANK_ADAPTORS, EXCLUDED, TAXONOMY, get_taxonomy_children
+from config import (
+    BANK_ADAPTORS,
+    CONFIDENCE_THRESHOLD,
+    EXCLUDED,
+    TAXONOMY,
+    UNCATEGORISED,
+    get_taxonomy_children,
+)
 from in_out import read_records, write_records
 from collections import Counter
 import math
 
-CONFIDENCE_THRESHOLD = 0.7
 SIMILARITY_THRESHOLD = 0.9
-OUTPUT_PATH = "assets/record_dtos.json"
 STOPWORDS = {
     "EFTPOS",
     "INTL",
@@ -26,7 +31,9 @@ BATCH_SIZE = 150
 
 
 def normalise(df: pd.DataFrame, bank: str) -> pd.DataFrame:
-    bank_adaptor = BANK_ADAPTORS[bank]
+    bank_adaptor = BANK_ADAPTORS.get(bank)
+    if not bank_adaptor:
+        raise ValueError(f"Unknown bank {bank!r}")
 
     # Remove empty cols
     df = df.dropna(axis=1, how="all")
@@ -165,37 +172,48 @@ def merge(
     records: list[Record],
     similarity_map: dict[int, list[int]],
 ) -> list[Record]:
-    """Merge category data from DTOs back to their Record objects"""
+    """Merge category data from DTOs back to their Record objects.
+
+    Every record comes out categorised. A weak classification is kept and left
+    for the user to confirm rather than thrown away: dropping it would silently
+    understate their spend, and a suggestion to correct beats a blank field.
+    Two things can go wrong, and they stay distinguishable afterwards:
+
+        no category from the LLM  -> UNCATEGORISED, confidence untouched
+        category below threshold  -> the suggestion, with its real confidence
+
+    Both are what the dashboard's review section reads back. CONFIDENCE_THRESHOLD
+    is now only a flag for "worth a human look", never a filter.
+    """
 
     # Create id -> Record mapping so we can retrieve a Record object by its id
     records_by_id = {r.id: r for r in records}
-    low_confidence: list[int] = []
 
-    # Get children -> parent category map for logging record parent categories
+    # Get children -> parent category map for assigning record parent categories
     children = get_taxonomy_children()
 
-    # Clear original categories so these do not persist and we can identify
-    # when the LLM couldn't classify a record
+    # Start everything uncategorised so the bank's own guesses cannot survive,
+    # and any record no DTO covers is visibly unclassified rather than stale
     for r in records:
-        r.category = None
+        r.category = UNCATEGORISED
+        r.parent = UNCATEGORISED
+        r.confidence = None
 
-    # Each record in categorsd_dtos represents a unique category
+    unclassified, low_confidence = 0, 0
+
+    # Each record in categorsd_dtos represents a group of alike records
     for cdto in categorsd_dtos:
-        # Create list of categegory member ids
+        # Create list of category member ids
         categ_member_ids = [cdto.id, *similarity_map.get(cdto.id, [])]
 
-        # Check the DTO category allocation exists and confidence is above threshold
-        if (
-            cdto.category is None
-            or cdto.confidence is None
-            or cdto.confidence < CONFIDENCE_THRESHOLD
-        ):
-            # If not pass the whole category to the low_confidence bucket
-            low_confidence.extend(categ_member_ids)
+        if cdto.category is None:
+            # The LLM declined to classify — leave the group as UNCATEGORISED
+            unclassified += len(categ_member_ids)
             continue
 
-        # Happy path: Merge category data from the DTO back to all
-        # category members' Record objects
+        if cdto.confidence is None or cdto.confidence < CONFIDENCE_THRESHOLD:
+            low_confidence += len(categ_member_ids)
+
         for categ_id in categ_member_ids:
             # if a Record id matches one of the ids in the category, retrieve
             # the Record and assign the category data from the DTO
@@ -204,23 +222,12 @@ def merge(
                 r.confidence = cdto.confidence
                 r.parent = children.get(cdto.category)
 
+    if unclassified:
+        print(f"{unclassified} record(s) left uncategorised")
     if low_confidence:
-        print(
-            f"The following couldn't be allocated due to low confidence:\n{low_confidence}"
-        )
+        print(f"{low_confidence} record(s) categorised below {CONFIDENCE_THRESHOLD} confidence")
 
     return records
-
-
-# def generate_groups(records: list[Record]) -> dict[str, list[Record]]:
-#     children = get_taxonomy_children()
-#     output: dict[str, list[Record]] = {parent: [] for parent in TAXONOMY.keys()}
-#     for r in records:
-#         # If the record category is a child, add it to the parent category
-#         if r.category and (parent := children.get(r.category)):
-#             output[parent].append(r)
-#
-#     return output
 
 
 def run_pipeline(df: pd.DataFrame, bank: str) -> list[Record]:
@@ -240,9 +247,6 @@ def run_pipeline(df: pd.DataFrame, bank: str) -> list[Record]:
 
     # Categorise records based on given taxonomy using LLM
     dtos_categrsd = categorise_records(unique_dtos)
-
-    # Write categorised values before discarding below threshold (for debugging)
-    write_records(dtos_categrsd, OUTPUT_PATH)
 
     # Merge back into Record objects
     merged = merge(dtos_categrsd, records, similarity_map)
