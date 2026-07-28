@@ -1,30 +1,16 @@
-import pandas as pd
+"""Launcher for the dashboard.
+
+    python main.py
+
+Data is uploaded through the app itself and lives only in the browser session,
+so there is no ingest step here and nothing to prepare first. For local work,
+set LOCAL_RECORDS in .env to seed each session from a records file.
+"""
+
 import analyse
-from in_out import write_records
-import ingest
-import argparse
-
-CSV_PATH = "assets/expenses_FY26.csv"
-OUTPUT_PATH = "assets/records.json"
-BANK = "NAB"
-
-
-def run_ingest():
-    df = pd.read_csv(CSV_PATH)
-    records = ingest.run_pipeline(df, BANK)
-    write_records(records, OUTPUT_PATH)
 
 
 def main():
-    # Optional CLI param to ingest csv file
-    # Must be run at least once on first launch
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ingest", action="store_true", help="Ingest csv file")
-    args = parser.parse_args()
-
-    if args.ingest:
-        run_ingest()
-
     analyse.launch()
 
 

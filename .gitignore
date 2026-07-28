@@ -1,4 +1,3 @@
-assets/
 __pycache__/
 __marimo__/
 .venv/
@@ -7,3 +6,6 @@ __marimo__/
 debug.py
 AGENTS.md
 README.md
+private_data/
+assets/record_dtos.json
+assets/records.json
