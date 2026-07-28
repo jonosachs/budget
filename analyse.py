@@ -10,29 +10,79 @@ Three entry points:
 draw into the current container and start nothing. `launch()` is what actually
 opens a browser.
 
+Records live in `st.session_state` and are never written to disk. The app is
+multi-tenant by construction: each viewer uploads their own CSV, sees only their
+own data, and leaves nothing behind. Anything user-supplied must therefore stay
+out of `@st.cache_data`, whose cache is shared across every session.
+
+A cold session opens on committed sample data, so a first-time visitor gets a
+working dashboard to explore rather than an empty uploader; a notice says so, and
+uploading anything replaces it. The uploader lives in the sidebar beside the
+download from the start. It takes
+either a raw bank export (which runs the pipeline) or a processed export from
+this app (which loads straight back in) — see `is_processed`. Because a refresh
+ends the session and its data with it, that download is the only way a viewer
+can keep a result without paying for a second pipeline run.
+
+Pipeline progress is streamed to the page by capturing its stdout, so ingest.py
+needs no knowledge of Streamlit — see `StreamlitWriter`.
+
 The interactive sections are cross-filtered through one shared `Selection` (see
 the class docstring): a click on the heatmap or the trend narrows everything
 else, and each section ignores only the dimension it is itself the source of.
 The top-10 tables sit outside that — they are a fixed reference, not a control.
 
-Importing this module has no side effects. `st.set_page_config` lives in `main()`
+Importing this module draws nothing and starts nothing; the one thing it does do
+is read `.env`, which has to happen before LOCAL_RECORDS. `st.set_page_config`
+lives in `main()`
 alone, since Streamlit allows it only once per page and only before any other
 `st` call — an embedding app owns that decision, not this module.
 """
 
-from in_out import read_records, write_records
+from in_out import read_records
 from models import Record
-from config import get_taxonomy_children, EXCLUDED
+from config import (
+    get_taxonomy_children,
+    BANK_ADAPTORS,
+    CONFIDENCE_THRESHOLD,
+    EXCLUDED,
+    UNCATEGORISED,
+)
 from dataclasses import dataclass, replace
+from dotenv import load_dotenv
 from pathlib import Path
+from streamlit.delta_generator import DeltaGenerator
 from typing import cast, ClassVar, Collection
+import contextlib
+import ingest
+import io
+import os
 import pandas as pd
 import streamlit as st
 import altair as alt
 import subprocess
 import sys
 
-RECORDS_PATH = "assets/records.json"
+# Derived from the model rather than listed, so adding a field to Record cannot
+# quietly drop it from the export or from the round-trip check.
+RECORD_FIELDS = tuple(Record.model_fields)
+# A processed export is recognised by carrying every field Record demands. Raw
+# bank exports use the bank's own capitalised headers, so they never collide.
+EXPORT_COLUMNS = frozenset(
+    name for name, field in Record.model_fields.items() if field.is_required()
+)
+
+# Must run before LOCAL_RECORDS is read below. gemini.py also calls this, but not
+# until an LLM request is made — far too late for a constant resolved at import.
+load_dotenv()
+
+# Committed sample data, pre-categorised so a first visit lands on a working
+# dashboard with no LLM call. Synthetic — see assets/generate_synthetic.py.
+DEMO_RECORDS = "assets/synthetic_processed.csv"
+
+# Set locally (in .env) to seed sessions from a file instead of the demo.
+# Deliberately absent in deployment: user data lives in the session and nowhere else.
+LOCAL_RECORDS = os.environ.get("LOCAL_RECORDS")
 
 CATEGORIES = sorted(get_taxonomy_children().keys())
 EDITABLE_CATEGORIES = CATEGORIES + [EXCLUDED]
@@ -65,7 +115,16 @@ CATEGORICAL = [
 SELECTION_KEY = "selection"  # the shared Selection, single source of truth
 EPOCH_KEY = "selection_epoch"  # bumped on clear, see widget_key()
 SEED_KEY = "explore_seed"  # last value pushed into the category picker
-SAVES_KEY = "saves"  # bumped on every save, see category_editor()
+SAVES_KEY = "saves"  # bumped on every committed edit, see category_editor()
+DATA_KEY = "records"  # the session's working frame — see load_frame()
+IS_DEMO_KEY = "is_demo"  # whether that frame is the bundled sample data
+ACCEPT_CLICK_KEY = "accept_click"  # {row, label} of the Accept button just clicked
+
+# A ButtonColumn takes the cell value as its label. Width is pixels: the button
+# is ~72px, so this leaves a little breathing room either side. It is a floor,
+# not a ceiling — a stretched table adds its share of any surplus on top.
+ACCEPT_LABEL = ":material/check: Accept"
+ACCEPT_WIDTH = 110
 DEFAULT_CATEGORIES = ()
 
 
@@ -176,13 +235,14 @@ def push(source: str, raw: object, **dimensions: tuple[str, ...]) -> None:
 # ---------------------------------------------------------------- data access
 
 
-@st.cache_data
-def get_records(path: str = RECORDS_PATH) -> pd.DataFrame:
+def build_frame(records: list[Record]) -> pd.DataFrame:
     """Row-level transactions with a 'YYYY-MM' month and positive 'spend'.
 
     spend is -amount, so debits are positive and refunds net against them.
+
+    The single place a frame is built, so an ingested CSV and a re-uploaded
+    processed one cannot drift into slightly different shapes.
     """
-    records = read_records(Record, path)
     df = pd.DataFrame([r.model_dump() for r in records])
     df["amount"] = df["amount"].astype(float)
     df["date"] = pd.to_datetime(df["date"])
@@ -190,33 +250,291 @@ def get_records(path: str = RECORDS_PATH) -> pd.DataFrame:
     df["month_label"] = df["date"].dt.strftime("%b %y")
     df["year"] = df["date"].dt.year
     df["spend"] = -df["amount"]
-    return df.dropna(subset=["category"])
+    # Nothing is dropped. A record the classifier was unsure about is still the
+    # user's money, so it counts towards every total and surfaces in the review
+    # section instead — see needs_review().
+    df["category"] = df["category"].fillna(UNCATEGORISED)
+    df["parent"] = df["parent"].fillna(UNCATEGORISED)
+    return df.reset_index(drop=True)
 
 
-def save_category_edits(edited: pd.DataFrame, path: str = RECORDS_PATH) -> int:
-    """Persist category corrections back to the source file, keyed by id.
+def needs_review(df: pd.DataFrame) -> pd.DataFrame:
+    """Rows worth a human look: unclassified, or classified without conviction.
 
-    Returns the number of records changed. Manual edits set confidence to 1.0
-    to mark them as human-vetted rather than an LLM guess.
+    Ordered by spend so the expensive uncertainty is dealt with first — the tail
+    of a long list is rarely worth anyone's time, and a $4 coffee filed under the
+    wrong category changes nothing.
+
+    A null confidence is what "nobody has looked at this" means: merge() leaves it
+    null when the classifier returned nothing, and every human action — an edit or
+    an accept — writes 1.0. That is what lets an Uncategorised row be dismissed;
+    without the isna() guard, confirming one could never clear it from the queue.
     """
-    records = read_records(Record, path)
-    new_category = dict(zip(edited["id"], edited["category"]))
+    unvetted = df["confidence"].isna()
+    unsure = df["confidence"].notna() & (df["confidence"] < CONFIDENCE_THRESHOLD)
+    flagged = df[((df["category"] == UNCATEGORISED) & unvetted) | unsure]
+    return cast(pd.DataFrame, flagged).sort_values("spend", ascending=False)
+
+
+def load_frame() -> pd.DataFrame | None:
+    """The session's working frame, or None until something has been uploaded.
+
+    Records live in session state and nowhere else: one viewer's data is never
+    written to disk and never reachable from another session. Note this rules
+    out @st.cache_data for anything user-supplied — that cache is keyed on
+    arguments and shared process-wide, so it would hand one viewer's
+    transactions to the next.
+
+    A cold session starts on the demo data so there is something to explore
+    before uploading anything. LOCAL_RECORDS overrides that with a file, so
+    local development doesn't mean re-uploading after every restart; it is unset
+    in deployment. A seed that will not load warns and falls back to the demo
+    rather than taking the page down — it is a convenience, not a dependency.
+    """
+    if DATA_KEY not in st.session_state:
+        if LOCAL_RECORDS:
+            try:
+                store_frame(build_frame(read_seed(LOCAL_RECORDS)), demo=False)
+            except (OSError, ValueError) as error:
+                # Missing file, wrong format, or rows that fail validation. Also
+                # catches pydantic's ValidationError, which subclasses ValueError.
+                st.warning(f"Could not load LOCAL_RECORDS {LOCAL_RECORDS!r} — {error}")
+
+        if DATA_KEY not in st.session_state and Path(DEMO_RECORDS).exists():
+            store_frame(build_frame(to_records(pd.read_csv(DEMO_RECORDS))), demo=True)
+    return st.session_state.get(DATA_KEY)
+
+
+def read_seed(path: str) -> list[Record]:
+    """Records from a seed file — a processed CSV export, or a records.json.
+
+    CSV is checked first because it is what the app's own download button
+    produces: the obvious file to point LOCAL_RECORDS at is one you exported
+    from here, and that should just work without converting it back to JSON.
+    """
+    if Path(path).suffix.lower() == ".csv":
+        return to_records(pd.read_csv(path))
+    return read_records(Record, path)
+
+
+def store_frame(df: pd.DataFrame, demo: bool = False) -> None:
+    """Make `df` the session's data. `demo` drives the sample-data notice only."""
+    st.session_state[DATA_KEY] = df
+    st.session_state[IS_DEMO_KEY] = demo
+
+
+def apply_category_edits(edited: pd.DataFrame) -> int:
+    """Fold category corrections into the session frame, keyed by id.
+
+    Returns the number of rows changed. Manual edits set confidence to 1.0 to
+    mark them as human-vetted rather than an LLM guess.
+    """
+    df = load_frame()
+    if df is None:
+        return 0
+
     children = get_taxonomy_children()  # child -> parent
+    index_of = pd.Series(df.index, index=df["id"])
 
     changed = 0
-    for r in records:
-        category = new_category.get(r.id)
-        if category is not None and category != r.category:
-            r.category = category
-            # EXCLUDED has no taxonomy parent, so it is its own — without this
-            # children.get() returns None and the record loses its parent entirely
-            r.parent = EXCLUDED if category == EXCLUDED else children.get(category)
-            r.confidence = 1.0
-            changed += 1
+    for record_id, category in zip(edited["id"], edited["category"]):
+        i = index_of.get(record_id)
+        if i is None or df.at[i, "category"] == category:
+            continue
+        df.at[i, "category"] = category
+        # EXCLUDED has no taxonomy parent, so it is its own — without this
+        # children.get() returns None and the row loses its parent entirely
+        df.at[i, "parent"] = EXCLUDED if category == EXCLUDED else children.get(category)
+        df.at[i, "confidence"] = 1.0
+        changed += 1
 
-    if changed:
-        write_records(records, path)
     return changed
+
+
+def confirm_categories(record_ids: Collection[int]) -> int:
+    """Mark rows as human-vetted, keeping the category they already have.
+
+    The counterpart to apply_category_edits: that one records "this is wrong, it
+    is X", this one records "this is right". Both write confidence 1.0, which is
+    the single marker for "a person has ruled on this row" — so both take the row
+    out of the review queue.
+    """
+    df = load_frame()
+    if df is None:
+        return 0
+
+    # NaN != 1.0 is True, so never-vetted rows are picked up here as intended
+    mask = df["id"].isin(list(record_ids)) & (df["confidence"] != 1.0)
+    df.loc[mask, "confidence"] = 1.0
+    return int(mask.sum())
+
+
+def accept_clicked(row_ids: tuple[int, ...]) -> None:
+    """on_click handler for the review table's Accept column.
+
+    A ButtonColumn reports the *position* of the row clicked, not its contents,
+    so the ids of the rows as displayed are captured when the table is drawn and
+    passed in — reconstructing them here would risk indexing a list that has
+    since been reordered.
+
+    Runs as a callback rather than inline because Streamlit reruns of its own
+    accord once a callback returns; doing it here means no st.rerun(), and no
+    chance of the click being read twice.
+    """
+    click = st.session_state.get(ACCEPT_CLICK_KEY)
+    if click is None:
+        return
+
+    row = click["row"]
+    if 0 <= row < len(row_ids) and confirm_categories([row_ids[row]]):
+        st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
+
+
+# ------------------------------------------------------------------- ingest
+
+
+class StreamlitWriter(io.TextIOBase):
+    """A stdout stand-in that renders each completed line into a container.
+
+    The pipeline already narrates itself with print(), so capturing stdout is
+    what makes it live on the page — ingest.py stays a plain module with no
+    Streamlit import and no second progress protocol to keep in sync.
+
+    Buffering to the newline is required, not cosmetic: print("a", "b") issues
+    four separate write() calls ("a", " ", "b", "\\n"), so passing each one
+    straight through would scatter one message across four rendered lines.
+    """
+
+    def __init__(self, container: DeltaGenerator) -> None:
+        self.container = container
+        self.buffer = ""
+
+    def write(self, s: str) -> int:
+        self.buffer += s
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            if line.strip():
+                self.container.write(line)
+        return len(s)
+
+
+def is_processed(df: pd.DataFrame) -> bool:
+    """Has this CSV already been through the pipeline?
+
+    Detected by shape rather than by asking the user, since getting the answer
+    wrong is expensive in one direction: re-running the LLM over an already
+    categorised file costs money and a quota slot for no benefit.
+    """
+    return EXPORT_COLUMNS.issubset(df.columns)
+
+
+def to_records(df: pd.DataFrame) -> list[Record]:
+    """Rebuild Records from a processed export, reusing the model for parsing.
+
+    Dates and amounts come back as strings from CSV; Record's own validation is
+    what turns them into date and Decimal, so a round-tripped file lands in
+    exactly the state an ingest would have produced.
+    """
+    rows = df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
+    return [Record.model_validate(row) for row in rows]
+
+
+def to_export_csv(df: pd.DataFrame) -> bytes:
+    """Serialise the session frame back to a re-uploadable CSV.
+
+    Only the Record fields go out — month, spend and friends are derived on
+    load, so exporting them would just be stale duplication.
+    """
+    columns = [c for c in RECORD_FIELDS if c in df.columns]
+    return df[columns].to_csv(index=False).encode()
+
+
+def run_ingest(file, bank: str) -> list[Record] | None:
+    """Run an uploaded CSV through the pipeline, streaming its log to the page.
+
+    Returns the records, or None if the run failed. Everything that can
+    realistically fail here is external — a missing API key, a CSV that isn't
+    from `bank` — so failure is reported in place rather than raised, leaving
+    whatever the session already had untouched.
+    """
+    with st.status("Running ingest pipeline…", expanded=True) as status:
+        try:
+            with contextlib.redirect_stdout(StreamlitWriter(status)):
+                records = ingest.run_pipeline(pd.read_csv(file), bank)
+        except Exception as error:
+            status.update(label="Ingest failed", state="error")
+            st.exception(error)
+            return None
+
+        status.update(label=f"Ingested {len(records)} records", state="complete")
+    return records
+
+
+def render_upload(replacing: bool) -> None:
+    """Upload a CSV — either a raw bank export or a processed one from here.
+
+    `replacing` only changes the warning: loading anything discards the
+    session's current frame, manual category corrections included.
+    """
+    file = st.file_uploader("CSV file", type="csv")
+    bank = st.selectbox("Bank", sorted(BANK_ADAPTORS))
+    if replacing:
+        st.caption("Loading a file replaces the current data, including your edits.")
+
+    if file is None:
+        st.caption(
+            "A raw bank export runs the categorisation pipeline. A processed "
+            "export downloaded from here loads straight back in, free."
+        )
+        return
+
+    # Peek at the shape before committing to the expensive path. read_csv
+    # consumes the buffer, so rewind for whichever branch reads it next.
+    peeked = pd.read_csv(file)
+    file.seek(0)
+
+    if is_processed(peeked):
+        st.success("Processed export detected — no pipeline run needed.")
+        if st.button("Load data", type="primary"):
+            store_frame(build_frame(to_records(peeked)), demo=False)
+            st.rerun()
+        return
+
+    st.info(f"Raw bank export detected — {len(peeked)} rows to categorise.")
+    if st.button("Run ingest", type="primary"):
+        if records := run_ingest(file, bank):
+            store_frame(build_frame(records), demo=False)
+            st.rerun()
+
+
+def render_demo_notice() -> None:
+    """Say plainly that this is not the viewer's data.
+
+    Sits above the dashboard rather than in the sidebar: someone who mistakes
+    sample spending for their own has been actively misled, so it has to be
+    somewhere they cannot miss it.
+    """
+    st.info(
+        "Showing sample data so you can explore the dashboard. Upload your own "
+        "bank CSV from the sidebar to analyse it — nothing you upload is stored.",
+        icon=":material/science:",
+    )
+
+
+def render_download(df: pd.DataFrame) -> None:
+    """Export the current frame, edits included.
+
+    This is the only durability the app offers: records live in session state,
+    so a browser refresh loses them and re-ingesting a raw export costs another
+    LLM run. Downloading and re-uploading is the way back in for free.
+    """
+    st.download_button(
+        "Download processed CSV",
+        data=to_export_csv(df),
+        file_name="budget_processed.csv",
+        mime="text/csv",
+        width="stretch",
+    )
 
 
 # ------------------------------------------------------------------- helpers
@@ -313,42 +631,86 @@ def render_summary(df: pd.DataFrame) -> None:
     )
 
 
-def category_editor(frame: pd.DataFrame, key: str, columns: dict) -> None:
-    """Transaction table whose only editable column is Category, plus a save action.
+def category_editor(
+    frame: pd.DataFrame, key: str, columns: dict, confirmable: bool = False
+) -> None:
+    """Transaction table whose only editable column is Category.
 
     Everything else is a fact the CSV owns, so `disabled` is derived rather than
     listed — a column added to `frame` cannot accidentally become editable. `id`
     rides along hidden because it is what matches an edit back to its record.
 
-    The key carries a save counter: a data_editor holds pending edits against row
-    *positions*, and saving can move a row out of the table under it (correcting a
-    category drops it from a category-filtered drilldown). Without a fresh widget
-    those edits would land on whichever rows shuffled into those positions.
+    `confirmable` adds an Accept button, for the review queue: a suggestion that
+    is already right needs a way to be agreed with, otherwise the only way to
+    clear it would be to change the category to something else and back.
+
+    Edits commit as they are made. A data_editor reruns the script on every cell
+    change, so the edit is already in hand; applying it there is what lets Parent
+    follow Category immediately, which it cannot do while a change sits pending
+    in the widget. There is nothing to batch — the frame is in memory, so a write
+    costs nothing, and a Save button would only be a second click before the
+    parent could catch up.
+
+    The key carries a change counter: a data_editor holds pending edits against
+    row *positions*, and committing one can move a row out of the table under it
+    (correcting a category drops it from a category-filtered drilldown, or off
+    the review queue). Bumping the counter builds a fresh widget, which both
+    discards the now-stale diff and stops it being re-applied to whichever rows
+    shuffled into those positions.
     """
+    editable = {"category"}
+    accept_config: dict = {}
+    if confirmable:
+        # Transient, never part of the session frame — it is a control, not data.
+        # assign() appends, which puts it last, immediately after category,
+        # parent and confidence: you accept on the strength of those three, so
+        # the button belongs beside them rather than before you have read them.
+        frame = frame.assign(accept=ACCEPT_LABEL)
+        # Left out of `disabled`: a ButtonColumn is read-only regardless, and
+        # disabling it risks the frontend swallowing the click too.
+        editable.add("accept")
+        accept_config["accept"] = st.column_config.ButtonColumn(
+            "",  # no header — a column of buttons needs no explaining
+            width=ACCEPT_WIDTH,
+            type="primary",  # green, via primaryColor in .streamlit/config.toml
+            help="Confirm this category as correct",
+            key=ACCEPT_CLICK_KEY,
+            on_click=accept_clicked,
+            # Row ids as displayed, since the click reports a position
+            args=(tuple(frame["id"]),),
+        )
+
     edited = st.data_editor(
         frame,
         column_config={
             "id": None,  # hidden, but kept so we can map edits back
+            # Pixels, not "small" (75px): that truncated "Restaurants & Takeaway"
+            # and "Uncategorised". Stretch tables papered over it by handing out
+            # surplus width; a content-sized one shows exactly what you ask for.
             "category": st.column_config.SelectboxColumn(
-                "Category", options=EDITABLE_CATEGORIES, required=True, width="small"
+                "Category", options=EDITABLE_CATEGORIES, required=True, width=190
             ),
-            "parent": st.column_config.TextColumn("Parent", width="small"),
+            "parent": st.column_config.TextColumn("Parent", width=130),
+            **accept_config,
             **columns,
         },
-        disabled=[c for c in frame.columns if c != "category"],
+        disabled=[c for c in frame.columns if c not in editable],
         hide_index=True,
+        # Every table stretches, so they all line up down the page. The cost is
+        # that Streamlit hands any leftover width out evenly to every column,
+        # explicit pixel widths included — a button column cannot be pinned
+        # narrow here. Sizing the data columns generously is the lever: the less
+        # surplus there is, the less of it lands behind the button.
+        width="stretch",
         key=f"{key}:{st.session_state.get(SAVES_KEY, 0)}",
     )
 
-    if st.button("Save corrections", key=f"{key}:save"):
-        changed = save_category_edits(cast(pd.DataFrame, edited))
-        if changed:
-            get_records.clear()
-            st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
-            st.success(f"Updated {changed} record(s).")
-            st.rerun()
-        else:
-            st.info("No changes to save.")
+    if apply_category_edits(cast(pd.DataFrame, edited)):
+        st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
+        # Rerun so Parent, the totals and the review queue all reflect the edit.
+        # This terminates: the new widget has no pending diff, so the next run
+        # finds nothing to apply.
+        st.rerun()
 
 
 def render_top_tables(df: pd.DataFrame, top_n: int = 10) -> None:
@@ -654,6 +1016,75 @@ def render_drilldown(df: pd.DataFrame, selection: Selection) -> None:
     )
 
 
+def render_review(df: pd.DataFrame) -> None:
+    """The classifier's own doubts, as a to-do list.
+
+    Deliberately outside the cross-filtering: it is a queue to work through, not
+    a view of the current selection, and it takes the unfiltered frame so a stray
+    heatmap click cannot hide rows still needing attention. A correction sets
+    confidence to 1.0, so each row leaves the queue as it is dealt with and the
+    section disappears once it is empty.
+    """
+    flagged = needs_review(df)
+    if flagged.empty:
+        return
+
+    total = flagged["spend"].sum()
+    # The key is what keeps this open while you work through it. Without one,
+    # Streamlit derives the expander's identity from its parameters — and this
+    # label carries a count that drops with every correction, so each edit would
+    # look like a brand new expander and snap back to collapsed. `expanded` is
+    # only the initial state; the key persists whatever the user last chose.
+    with st.expander(
+        f"⚠︎  {len(flagged)} transaction(s) need review — ${total:,.0f}",
+        expanded=False,
+        key="review_expander",
+    ):
+        st.caption(
+            f"Either the classifier returned nothing, or it was under "
+            f"{CONFIDENCE_THRESHOLD:.0%} confident. Largest first, and already counted "
+            "in every total above. Hit **Accept** to confirm a category as it "
+            "stands, or pick a different one — either way the row leaves this list."
+        )
+        category_editor(
+            cast(
+                pd.DataFrame,
+                flagged[
+                    [
+                        "id",
+                        "date",
+                        "amount",
+                        "merchant",
+                        "description",
+                        "category",
+                        "parent",
+                        "confidence",
+                    ]
+                ].reset_index(drop=True),
+            ),
+            key="review_editor",
+            # Deliberately roomy. Width left over after these is split evenly
+            # across all eight columns, and an eighth of it lands behind the
+            # Accept button — so the surplus is what has to be kept small.
+            # Description takes the lion's share: it is what identifies a
+            # transaction when the merchant is missing, which here it often is.
+            columns={
+                "date": st.column_config.DateColumn(
+                    "Date", format="DD MMM YYYY", width=110
+                ),
+                "amount": st.column_config.NumberColumn(
+                    "Amount", format="dollar", width=110
+                ),
+                "merchant": st.column_config.TextColumn("Merchant", width=210),
+                "description": st.column_config.TextColumn("Description", width=560),
+                "confidence": st.column_config.NumberColumn(
+                    "Confidence", format="%.2f", width=120
+                ),
+            },
+            confirmable=True,
+        )
+
+
 def explore_seed(
     options: list[str], selection: Selection, current: list[str]
 ) -> list[str]:
@@ -736,11 +1167,30 @@ def render_explore(df: pd.DataFrame, selection: Selection) -> None:
 def render(df: pd.DataFrame | None = None) -> None:
     """Render the whole page into the current Streamlit container.
 
-    Pass a frame to analyse something other than the records file — it must carry
-    the columns get_records() builds (month, month_label, year, spend).
+    Pass a frame to analyse something other than the session's own — it must
+    carry the columns build_frame() adds (month, month_label, year, spend).
+    Upload and download are offered only for the session-backed frame, since a
+    caller passing its own data owns how that data comes and goes.
     """
-    df = get_records() if df is None else df
+    session_backed = df is None
+    if df is None:  # not `session_backed`, which a type checker cannot narrow on
+        df = load_frame()
+        if df is None:  # only reachable if the bundled demo file is missing
+            st.info("Upload a CSV to get started.")
+            render_upload(replacing=False)
+            return
+        if st.session_state.get(IS_DEMO_KEY):
+            render_demo_notice()
+
+    # Export before filtering: the download is the session's whole dataset, not
+    # whatever slice happens to be on screen
+    full = df
     df = sidebar_filters(df)
+    if session_backed:
+        with st.sidebar:
+            render_download(full)
+            with st.expander("Load a different CSV"):
+                render_upload(replacing=True)
 
     # Read the shared selection once, up front, and hand the same value to every
     # section. Sections don't feed each other in render order any more — they all
@@ -749,6 +1199,9 @@ def render(df: pd.DataFrame | None = None) -> None:
 
     render_selection_bar(selection)
     render_summary(selection.filter(df))
+    # Unfiltered on purpose — a review queue the current selection could hide is
+    # worse than no queue at all
+    render_review(full)
     render_top_tables(df)
     render_parent_heatmap(df, selection)
     render_explore(df, selection)
@@ -769,7 +1222,7 @@ def launch(port: int = 8501, open_browser: bool = True) -> int:
     Shells out because `streamlit run` has to own the script's execution — a
     Streamlit page cannot be started by importing it. Uses the current
     interpreter (not a bare `streamlit` on PATH) so the active venv is honoured,
-    and pins cwd to this file's directory so RECORDS_PATH resolves wherever the
+    and pins cwd to this file's directory so relative paths resolve wherever the
     caller happens to be.
     """
     try:

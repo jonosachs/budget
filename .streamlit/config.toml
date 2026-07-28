@@ -1,0 +1,17 @@
+# Green primary, so the review queue's Accept buttons read as "confirm". A
+# ButtonColumn can only take its colour from the theme — the dataframe draws its
+# cells on a canvas, so no CSS can reach them — which makes this app-wide rather
+# than per-button. It also colours "Run ingest" and "Load data", where go-green
+# suits better than Streamlit's default red anyway.
+#
+# Set per mode rather than in a bare [theme] block: that block pins `base` to
+# light and overrides whatever the viewer's browser asked for. These sections
+# change only the colour and leave light/dark auto-detection alone.
+#
+# Light matches the green in analyse.py's CATEGORICAL chart palette; dark is the
+# same hue lifted, since #199e70 goes muddy against a dark background.
+[theme.light]
+primaryColor = "#199e70"
+
+[theme.dark]
+primaryColor = "#2ec48f"
