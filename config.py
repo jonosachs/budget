@@ -4,6 +4,16 @@
 # like any other top-level bucket.
 EXCLUDED = "Excluded"
 
+# Where a transaction lands when the LLM returns no category. Unlike EXCLUDED it
+# IS in TAXONOMY, so the model can also choose it outright, and it counts towards
+# totals like any other category — an unlabelled expense is still an expense.
+UNCATEGORISED = "Uncategorised"
+
+# Below this a classification is flagged for review, not discarded. Set high on
+# purpose: the model returns exactly 1.0 for ~82% of records, so a low bar caught
+# almost nothing, and flagging costs nothing now that flagged rows still count.
+CONFIDENCE_THRESHOLD = 0.85
+
 TAXONOMY = {
     "Housing": [
         "Mortgage",
@@ -44,6 +54,10 @@ TAXONOMY = {
         "Cafe & Coffee",
         "Restaurants & Takeaway",
         "Food Delivery",
+        # Consumed on the spot: vending machines, servo drinks, a milk bar run
+        # for a Coke. Groceries covers the same shops when you are stocking up —
+        # the split is provisioning vs eating now, not where you bought it.
+        "Snacks & Drinks",
         "Alcohol & Bars",
     ],
     "Car": [
@@ -254,7 +268,7 @@ def get_taxonomy_children() -> dict[str, str]:
 
 
 BANK_ADAPTORS = {
-    "nab": {
+    "NAB": {
         "columns": {
             "Date": "date",
             "Amount": "amount",
