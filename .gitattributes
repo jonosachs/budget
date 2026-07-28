@@ -1,0 +1,8 @@
+# The raw sample export mimics a real NAB file down to its CRLF line endings, so
+# it exercises the same parsing path as live data. Git's eol normalisation would
+# quietly rewrite that to LF on commit (core.autocrlf=input does exactly this),
+# leaving a clone with a file the generator would not reproduce.
+assets/synthetic_expenses.csv -text
+
+# synthetic_processed.csv is this app's own export format, written with LF, so it
+# is left to normalise like any other text file.
