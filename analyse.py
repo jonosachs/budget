@@ -40,7 +40,7 @@ alone, since Streamlit allows it only once per page and only before any other
 """
 
 from in_out import read_records
-from models import Record
+from models import Record, RecordDtoIn
 from config import (
     get_taxonomy_children,
     BANK_ADAPTORS,
@@ -276,6 +276,31 @@ def needs_review(df: pd.DataFrame) -> pd.DataFrame:
     return cast(pd.DataFrame, flagged).sort_values("spend", ascending=False)
 
 
+def group_similar(flagged: pd.DataFrame) -> dict[int, list[int]]:
+    """Collapse alike rows onto one representative: {rep id: every id it stands for}.
+
+    The same grouping the pipeline uses to avoid asking the LLM twice about the
+    same merchant, applied to the same end for the person doing the review —
+    three near-identical dinners are one decision, not three.
+
+    Recomputed rather than carried through from ingest, because the queue also
+    has to work for a CSV re-uploaded into a fresh session, where no map from the
+    original run exists. It is cheap: this runs over the review subset, not the
+    whole frame.
+
+    Grouping is scoped to the flagged rows alone. Reaching further would let
+    confirming one row silently rewrite a record already settled.
+    """
+    if flagged.empty:
+        return {}
+
+    # Sorted by spend on the way in, and get_similarity keeps the first record it
+    # sees as the representative — so each group is headed by its largest.
+    rows = flagged.astype(object).where(pd.notna(flagged), None).to_dict("records")
+    dtos = [RecordDtoIn.model_validate(row) for row in rows]
+    return {rep: [rep, *members] for rep, members in ingest.get_similarity(dtos).items()}
+
+
 def load_frame() -> pd.DataFrame | None:
     """The session's working frame, or None until something has been uploaded.
 
@@ -323,11 +348,18 @@ def store_frame(df: pd.DataFrame, demo: bool = False) -> None:
     st.session_state[IS_DEMO_KEY] = demo
 
 
-def apply_category_edits(edited: pd.DataFrame) -> int:
+def apply_category_edits(
+    edited: pd.DataFrame, groups: dict[int, list[int]] | None = None
+) -> int:
     """Fold category corrections into the session frame, keyed by id.
 
     Returns the number of rows changed. Manual edits set confidence to 1.0 to
     mark them as human-vetted rather than an LLM guess.
+
+    With `groups`, an edited row stands for every alike row grouped behind it and
+    the correction lands on all of them — see group_similar(). Without it each
+    row speaks only for itself, which is what the other tables want: those list
+    individual records, not representatives.
     """
     df = load_frame()
     if df is None:
@@ -338,44 +370,69 @@ def apply_category_edits(edited: pd.DataFrame) -> int:
 
     changed = 0
     for record_id, category in zip(edited["id"], edited["category"]):
-        i = index_of.get(record_id)
-        if i is None or df.at[i, "category"] == category:
-            continue
-        df.at[i, "category"] = category
         # EXCLUDED has no taxonomy parent, so it is its own — without this
         # children.get() returns None and the row loses its parent entirely
-        df.at[i, "parent"] = EXCLUDED if category == EXCLUDED else children.get(category)
+        parent = EXCLUDED if category == EXCLUDED else children.get(category)
+        for target in (groups or {}).get(record_id, [record_id]):
+            i = index_of.get(target)
+            if i is None or df.at[i, "category"] == category:
+                continue
+            df.at[i, "category"] = category
+            df.at[i, "parent"] = parent
+            df.at[i, "confidence"] = 1.0
+            changed += 1
+
+    return changed
+
+
+def confirm_categories(record_ids: Collection[int]) -> int:
+    """Mark rows as human-vetted, adopting the first id's category across the rest.
+
+    The counterpart to apply_category_edits: that one records "this is wrong, it
+    is X", this one records "this is right". Both write confidence 1.0, the
+    single marker for "a person has ruled on this row", so both take the row out
+    of the review queue.
+
+    `record_ids` is a similarity group led by its representative — the row the
+    user actually saw and agreed with. The rest adopt its category, because
+    grouping is a claim that these are the same transaction: a table showing one
+    category and "covers 3" has promised that all three end up there. Leaving a
+    member on its own stale category would quietly break that promise.
+
+    A single id is just the degenerate group, and settles only itself.
+    """
+    df = load_frame()
+    if df is None or not (ids := list(record_ids)):
+        return 0
+
+    index_of = pd.Series(df.index, index=df["id"])
+    rep = index_of.get(ids[0])
+    if rep is None:
+        return 0
+    category, parent = df.at[rep, "category"], df.at[rep, "parent"]
+
+    changed = 0
+    for target in ids:
+        i = index_of.get(target)
+        # NaN != 1.0 is True, so never-vetted rows are picked up here as intended
+        if i is None or (df.at[i, "category"] == category and df.at[i, "confidence"] == 1.0):
+            continue
+        df.at[i, "category"] = category
+        df.at[i, "parent"] = parent
         df.at[i, "confidence"] = 1.0
         changed += 1
 
     return changed
 
 
-def confirm_categories(record_ids: Collection[int]) -> int:
-    """Mark rows as human-vetted, keeping the category they already have.
-
-    The counterpart to apply_category_edits: that one records "this is wrong, it
-    is X", this one records "this is right". Both write confidence 1.0, which is
-    the single marker for "a person has ruled on this row" — so both take the row
-    out of the review queue.
-    """
-    df = load_frame()
-    if df is None:
-        return 0
-
-    # NaN != 1.0 is True, so never-vetted rows are picked up here as intended
-    mask = df["id"].isin(list(record_ids)) & (df["confidence"] != 1.0)
-    df.loc[mask, "confidence"] = 1.0
-    return int(mask.sum())
-
-
-def accept_clicked(row_ids: tuple[int, ...]) -> None:
+def accept_clicked(row_groups: tuple[tuple[int, ...], ...]) -> None:
     """on_click handler for the review table's Accept column.
 
     A ButtonColumn reports the *position* of the row clicked, not its contents,
-    so the ids of the rows as displayed are captured when the table is drawn and
-    passed in — reconstructing them here would risk indexing a list that has
-    since been reordered.
+    so what each displayed row stands for is captured when the table is drawn and
+    passed in — reconstructing it here would risk indexing a list that has since
+    been reordered. Each entry is a whole similarity group, so one click settles
+    every record behind that row.
 
     Runs as a callback rather than inline because Streamlit reruns of its own
     accord once a callback returns; doing it here means no st.rerun(), and no
@@ -386,7 +443,7 @@ def accept_clicked(row_ids: tuple[int, ...]) -> None:
         return
 
     row = click["row"]
-    if 0 <= row < len(row_ids) and confirm_categories([row_ids[row]]):
+    if 0 <= row < len(row_groups) and confirm_categories(row_groups[row]):
         st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
 
 
@@ -632,7 +689,11 @@ def render_summary(df: pd.DataFrame) -> None:
 
 
 def category_editor(
-    frame: pd.DataFrame, key: str, columns: dict, confirmable: bool = False
+    frame: pd.DataFrame,
+    key: str,
+    columns: dict,
+    confirmable: bool = False,
+    groups: dict[int, list[int]] | None = None,
 ) -> None:
     """Transaction table whose only editable column is Category.
 
@@ -676,8 +737,13 @@ def category_editor(
             help="Confirm this category as correct",
             key=ACCEPT_CLICK_KEY,
             on_click=accept_clicked,
-            # Row ids as displayed, since the click reports a position
-            args=(tuple(frame["id"]),),
+            # What each displayed row stands for, since the click reports only a
+            # position: its own id, plus any alike rows grouped behind it
+            args=(
+                tuple(
+                    tuple((groups or {}).get(i, [i])) for i in cast(list, frame["id"])
+                ),
+            ),
         )
 
     edited = st.data_editor(
@@ -705,7 +771,7 @@ def category_editor(
         key=f"{key}:{st.session_state.get(SAVES_KEY, 0)}",
     )
 
-    if apply_category_edits(cast(pd.DataFrame, edited)):
+    if apply_category_edits(cast(pd.DataFrame, edited), groups):
         st.session_state[SAVES_KEY] = st.session_state.get(SAVES_KEY, 0) + 1
         # Rerun so Parent, the totals and the review queue all reflect the edit.
         # This terminates: the new widget has no pending diff, so the next run
@@ -1024,19 +1090,29 @@ def render_review(df: pd.DataFrame) -> None:
     heatmap click cannot hide rows still needing attention. A correction sets
     confidence to 1.0, so each row leaves the queue as it is dealt with and the
     section disappears once it is empty.
+
+    Alike rows are collapsed onto one representative, so three near-identical
+    dinners are a single decision rather than the same judgement three times. The
+    count is of decisions; the dollar total is of every record behind them.
     """
     flagged = needs_review(df)
     if flagged.empty:
         return
 
+    groups = group_similar(flagged)
+    reps = cast(pd.DataFrame, flagged[flagged["id"].isin(list(groups))]).assign(
+        covers=lambda f: [len(groups[i]) for i in f["id"]]
+    )
     total = flagged["spend"].sum()
     # The key is what keeps this open while you work through it. Without one,
     # Streamlit derives the expander's identity from its parameters — and this
     # label carries a count that drops with every correction, so each edit would
     # look like a brand new expander and snap back to collapsed. `expanded` is
     # only the initial state; the key persists whatever the user last chose.
+    grouped = len(reps) != len(flagged)
     with st.expander(
-        f"⚠︎  {len(flagged)} transaction(s) need review — ${total:,.0f}",
+        f"⚠︎  {len(reps)} to review — ${total:,.0f}"
+        + (f"  ({len(flagged)} transactions)" if grouped else ""),
         expanded=False,
         key="review_expander",
     ):
@@ -1045,11 +1121,17 @@ def render_review(df: pd.DataFrame) -> None:
             f"{CONFIDENCE_THRESHOLD:.0%} confident. Largest first, and already counted "
             "in every total above. Hit **Accept** to confirm a category as it "
             "stands, or pick a different one — either way the row leaves this list."
+            + (
+                "  Alike transactions are grouped: **Covers** is how many your "
+                "decision settles at once."
+                if grouped
+                else ""
+            )
         )
         category_editor(
             cast(
                 pd.DataFrame,
-                flagged[
+                reps[
                     [
                         "id",
                         "date",
@@ -1059,6 +1141,7 @@ def render_review(df: pd.DataFrame) -> None:
                         "category",
                         "parent",
                         "confidence",
+                        "covers",
                     ]
                 ].reset_index(drop=True),
             ),
@@ -1080,8 +1163,15 @@ def render_review(df: pd.DataFrame) -> None:
                 "confidence": st.column_config.NumberColumn(
                     "Confidence", format="%.2f", width=120
                 ),
+                "covers": st.column_config.NumberColumn(
+                    "Covers",
+                    help="Transactions this decision applies to, including this one",
+                    format="%d",
+                    width=90,
+                ),
             },
             confirmable=True,
+            groups=groups,
         )
 
 
