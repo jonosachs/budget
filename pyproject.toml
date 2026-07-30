@@ -4,6 +4,9 @@ dependencies = [
   "google-genai",
   "pydantic",
   "python-dotenv",
+  "streamlit",
+  "pandas",
+  "altair",
 ]
 
 [tool.pyright]

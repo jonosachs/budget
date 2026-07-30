@@ -7,6 +7,10 @@ taxonomy; everything it is unsure about lands in a review queue for you to settl
 Uploaded data lives in the browser session only — it is never written to disk and
 never reachable from another session.
 
+## Screenshot
+
+<img src="assets/screenshot.png" />
+
 ## Quick start
 
 ```sh

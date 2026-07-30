@@ -5,7 +5,6 @@ __marimo__/
 .env
 debug.py
 AGENTS.md
-README.md
 private_data/
 assets/record_dtos.json
 assets/records.json
